@@ -73,7 +73,7 @@ DONE_CLAUSE = (' When I say "close the tab", run {prbot}/bin/prbot done after ev
 # ---------------------------------------------------------------- config / log
 
 def load_config():
-    cfg = {"GH_USER": "", "POLL_SECS": "60", "MAX_JOBS": "3", "LAG_SECS": "300", "MUX": "tos", "SESSION": "",
+    cfg = {"GH_USER": "", "POLL_SECS": "60", "MAX_JOBS": "3", "LAG_SECS": "300", "MUX": "auto", "SESSION": "",
            "ZELLIJ_SESSION": "", "CLAUDE_MODEL": "", "NTFY_TOPIC": "", "IGNORE_AUTHORS": "Copilot",
            "PERMISSION_MODE": "auto", "REPO_DIRS": "", "CLOSE_GRACE_SECS": "15", "CLAUDE_EFFORT": ""}
     path = os.path.join(HERE, "config.env")
@@ -94,10 +94,57 @@ CFG = load_config()
 # The multiplexer prbot drives. Both take the same commands; only the program and the variables it sets in each
 # pane differ: (the pane's id, the session's name).
 MUXES = {"tos": ("TOS_PANE_ID", "TOS_SESSION"), "zellij": ("ZELLIJ_PANE_ID", "ZELLIJ_SESSION_NAME")}
-MUX = CFG["MUX"].lower()
-if MUX not in MUXES:
-    sys.exit(f"prbot: MUX={CFG['MUX']} in config.env; use tos or zellij")
-PANE_VAR, SESSION_VAR = MUXES[MUX]
+MUX_FILE = os.path.join(HERE, "mux")  # the one ./bin/start used, for MUX=auto (git ignores it)
+MUX_SETTING = CFG["MUX"].strip().lower()
+if MUX_SETTING not in (*MUXES, "auto"):
+    sys.exit(f"prbot: MUX={CFG['MUX']} in config.env; use auto, tos or zellij")
+NO_MUX = ("can't tell whether to use tos or zellij (MUX=auto in config.env). Run ./bin/start inside the one you "
+          "want, or set MUX=tos or MUX=zellij")
+
+
+def pane_mux():
+    """The multiplexer whose pane this runs in, from the pane's variables. None outside both, and inside both (one
+    started in a pane of the other), because which one is the inner one can't be told."""
+    inside = [name for name, names in MUXES.items() if all(os.environ.get(v) for v in names)]
+    return inside[0] if len(inside) == 1 else None
+
+
+def remembered_mux():
+    """The multiplexer ./bin/start last used, if any."""
+    try:
+        with open(MUX_FILE) as f:
+            name = f.read().strip()
+    except OSError:
+        return None
+    return name if name in MUXES else None
+
+
+def installed_mux():
+    """The only multiplexer installed, or None (neither, or both)."""
+    found = [name for name in MUXES if shutil.which(name)]
+    return found[0] if len(found) == 1 else None
+
+
+def choose_mux():
+    """(the multiplexer or None, how it was chosen). MUX=tos or MUX=zellij always wins. With MUX=auto: the one
+    ./bin/start remembered, else the one whose pane this runs in, else the only one installed."""
+    if MUX_SETTING != "auto":
+        return MUX_SETTING, f"MUX={MUX_SETTING} in config.env"
+    for name, how in ((remembered_mux(), "remembered from ./bin/start"), (pane_mux(), "you're in a {} pane"),
+                      (installed_mux(), "the only one installed")):
+        if name:
+            return name, "MUX=auto: " + how.format(name)
+    return None, "MUX=auto"
+
+
+def use_mux(name):
+    global MUX, PANE_VAR, SESSION_VAR
+    MUX = name
+    PANE_VAR, SESSION_VAR = MUXES[name] if name else (None, None)
+
+
+MUX, MUX_HOW = choose_mux()
+use_mux(MUX)
 SESSION = CFG["SESSION"] or CFG["ZELLIJ_SESSION"] or "prbot"  # ZELLIJ_SESSION: the setting's old name
 TOS_API = 2  # the oldest tos extension API prbot works with: TOS_PANE_ID and TOS_SESSION came in API 2
 
@@ -428,9 +475,19 @@ def discover(state):
 
 # ---------------------------------------------------------------- tos or zellij
 
+# The variables a pane of either multiplexer has. They're left out when prbot runs one, so its session doesn't
+# depend on where you typed ./bin/start, and its tabs don't inherit the pane you typed it in. prbot always names
+# the session (-s), so it never needs them.
+PANE_VARS = {v for names in MUXES.values() for v in names} | {"ZELLIJ"}
+
+
 def mux(*args):
-    """Runs the multiplexer (tos or zellij) without the Claude variables, so they never reach its panes."""
-    return subprocess.run([MUX, *args], capture_output=True, text=True, env=clean_env())
+    """Runs the multiplexer (tos or zellij) without the Claude variables or your pane's, so neither reaches its
+    panes."""
+    if MUX is None:
+        die(NO_MUX)
+    env = {k: v for k, v in clean_env().items() if k not in PANE_VARS}
+    return subprocess.run([MUX, *args], capture_output=True, text=True, env=env)
 
 
 def zj(*args, session=None):
@@ -486,7 +543,7 @@ def find_tab(name):
 def own_tab_id():
     """The tab this process runs in, found through its own pane; None outside the prbot session.
     Never look a tab up by name here: another tab can have the same name."""
-    pane = os.environ.get(PANE_VAR)
+    pane = os.environ.get(PANE_VAR) if PANE_VAR else None
     if not pane or os.environ.get(SESSION_VAR) != SESSION:
         return None
     try:
@@ -921,6 +978,22 @@ def poller_tab():
 
 
 def cmd_start(a):
+    how = ""
+    if MUX_SETTING == "auto":
+        here = pane_mux()
+        old = remembered_mux()
+        if old and shutil.which(old):  # the poller may be running there, even if you're typing in the other one
+            use_mux(old)
+            if session_running() and poller_tab():
+                move = f" To move it to {here}: ./bin/stop, then ./bin/start again." if here and here != old else ""
+                print(f"poller is already running in {MUX} session '{SESSION}'.{move}")
+                print(f"attach:  {MUX} attach {SESSION}      (detach: Ctrl-o d)")
+                return
+        name = here or installed_mux()
+        if not name:
+            die(NO_MUX)
+        use_mux(name)
+        how = f" (MUX=auto: you're in a {name} pane)" if name == here else " (MUX=auto: the only one installed)"
     problem = mux_problem()
     if problem:
         die(problem)
@@ -933,7 +1006,9 @@ def cmd_start(a):
                *poll_args)
         if r.returncode != 0:
             die(f"{MUX} new-tab failed: {r.stderr.strip()}")
-        print(f"poller started in {MUX} session '{SESSION}'")
+        print(f"poller started in {MUX} session '{SESSION}'{how}")
+    with open(MUX_FILE, "w") as f:  # every other command uses this one from now on
+        f.write(MUX + "\n")
     print(f"attach:  {MUX} attach {SESSION}      (detach: Ctrl-o d)")
 
 
@@ -957,9 +1032,9 @@ def cmd_check(a):
 
     v = sys.version_info
     line(v >= (3, 9), "python", f"{v.major}.{v.minor}.{v.micro} (3.9 or later)")
-    problem = mux_problem()
+    problem = NO_MUX if MUX is None else mux_problem()
     detail = f"{MUX}, session '{SESSION}'" + (f" ({tos_api()[1]})" if MUX == "tos" and not problem else "")
-    line(problem is None, "multiplexer", problem or detail)
+    line(problem is None, "multiplexer", problem or f"{detail} ({MUX_HOW})")
     r = subprocess.run(["gh", "auth", "token"], capture_output=True, text=True) if shutil.which("gh") else None
     if r is None or r.returncode != 0 or not r.stdout.strip():
         line(False, "gh", "not installed" if r is None else "not logged in: run gh auth login")
@@ -1155,7 +1230,8 @@ CLOSING = os.path.join(CACHE, "closing")
 
 
 def closing_mark():
-    return os.path.join(CLOSING, re.sub(r"\D", "", os.environ.get(PANE_VAR, "")) or "none")
+    pane = os.environ.get(PANE_VAR, "") if PANE_VAR else ""
+    return os.path.join(CLOSING, re.sub(r"\D", "", pane) or "none")
 
 
 def cmd_done(a):

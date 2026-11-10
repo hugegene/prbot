@@ -17,6 +17,25 @@ import unittest
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+# The variables a tos or zellij pane has. MUX=auto reads them, and these tests may themselves run inside a pane, so
+# they're cleared for the whole run. A test that wants them sets them.
+PANE_VARS = ("TOS_PANE_ID", "TOS_SESSION", "ZELLIJ_PANE_ID", "ZELLIJ_SESSION_NAME", "ZELLIJ")
+_saved_pane_vars = {}
+
+
+def setUpModule():
+    _saved_pane_vars.update({k: os.environ.pop(k) for k in PANE_VARS if k in os.environ})
+
+
+def tearDownModule():
+    os.environ.update(_saved_pane_vars)
+
+
+def pane_of(name):
+    """The variables a pane of `name` (tos or zellij) has, with made-up values."""
+    return {"tos": {"TOS_PANE_ID": "3", "TOS_SESSION": "outer"},
+            "zellij": {"ZELLIJ_PANE_ID": "3", "ZELLIJ_SESSION_NAME": "outer", "ZELLIJ": "0"}}[name]
+
 
 def make_copy(tmp, config):
     """A copy of prbot in tmp/prbot, with `config` as its config.env. Returns its folder."""
@@ -60,7 +79,7 @@ class Config(unittest.TestCase):
 
     def test_defaults(self):
         m = self.module()
-        self.assertEqual((m.MUX, m.SESSION, m.PANE_VAR), ("tos", "prbot", "TOS_PANE_ID"))
+        self.assertEqual((m.MUX_SETTING, m.SESSION), ("auto", "prbot"))
 
     def test_zellij_and_the_old_session_setting(self):
         m = self.module(MUX="zellij", ZELLIJ_SESSION="old")
@@ -72,7 +91,7 @@ class Config(unittest.TestCase):
         root = make_copy(self.tmp, {"MUX": "screen"})
         r = subprocess.run([sys.executable, os.path.join(root, "prbot.py"), "ls"], capture_output=True, text=True)
         self.assertEqual(r.returncode, 1)
-        self.assertIn("MUX=screen in config.env; use tos or zellij", r.stderr)
+        self.assertIn("MUX=screen in config.env; use auto, tos or zellij", r.stderr)
 
     def test_one_pair_of_quotes_is_removed(self):
         m = self.module(MESSAGE_REVIEW='"Review #{n} "carefully""', CLAUDE_MODEL="it's")
@@ -195,6 +214,65 @@ class TosVersion(unittest.TestCase):
         self.assertIn("Run: tos update", self.m.mux_problem())
 
 
+class Auto(unittest.TestCase):
+    """MUX=auto: which multiplexer prbot picks, and how it says it chose."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def module(self, installed=("tos", "zellij"), panes=(), remembered=None, **config):
+        """prbot as it loads with these multiplexers on PATH (stand-ins), inside panes of `panes`, and with
+        `remembered` in its mux file."""
+        bin_dir = tempfile.mkdtemp(dir=self.tmp)
+        for name in installed:
+            with open(os.path.join(bin_dir, name), "w") as f:
+                f.write("#!/bin/sh\nexit 0\n")
+            os.chmod(os.path.join(bin_dir, name), 0o755)
+        root = make_copy(tempfile.mkdtemp(dir=self.tmp), dict({"MUX": "auto"}, **config))
+        if remembered:
+            with open(os.path.join(root, "mux"), "w") as f:
+                f.write(remembered + "\n")
+        env = {"PATH": bin_dir}
+        for name in panes:
+            env.update(pane_of(name))
+        saved = {k: os.environ.get(k) for k in env}
+        os.environ.update(env)
+        try:
+            m = load(root)
+        finally:
+            for k, v in saved.items():
+                restore_env(k, v)
+        return m, root, env
+
+    def test_the_pane_it_runs_in(self):
+        for name in ("tos", "zellij"):
+            m = self.module(panes=[name])[0]
+            self.assertEqual((m.MUX, m.MUX_HOW), (name, f"MUX=auto: you're in a {name} pane"))
+
+    def test_outside_both_or_inside_both_it_takes_the_only_one_installed(self):
+        m = self.module(installed=["zellij"])[0]
+        self.assertEqual((m.MUX, m.MUX_HOW), ("zellij", "MUX=auto: the only one installed"))
+        m = self.module(installed=["tos"], panes=["tos", "zellij"])[0]
+        self.assertEqual((m.MUX, m.MUX_HOW), ("tos", "MUX=auto: the only one installed"))
+
+    def test_when_it_cant_tell_it_says_so(self):
+        m, root, env = self.module(panes=["tos", "zellij"])
+        self.assertIsNone(m.MUX)
+        r = subprocess.run([sys.executable, os.path.join(root, "prbot.py"), "ls"], capture_output=True, text=True,
+                           env=dict(os.environ, **env))
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("can't tell whether to use tos or zellij", r.stderr)
+
+    def test_what_start_remembered_beats_the_pane(self):
+        m = self.module(panes=["tos"], remembered="zellij")[0]
+        self.assertEqual((m.MUX, m.MUX_HOW), ("zellij", "MUX=auto: remembered from ./bin/start"))
+
+    def test_a_setting_always_wins(self):
+        m = self.module(MUX="tos", panes=["zellij"], remembered="zellij")[0]
+        self.assertEqual((m.MUX, m.MUX_HOW), ("tos", "MUX=tos in config.env"))
+
+
 class Check(unittest.TestCase):
     """./bin/prbot check, with stand-ins for gh, tos, claude and the notification program."""
 
@@ -210,7 +288,8 @@ class Check(unittest.TestCase):
             self.fake(name, body)
         clone = os.path.join(self.tmp, "widgets")
         os.makedirs(os.path.join(clone, ".git"))
-        self.root = make_copy(self.tmp, {"GH_USER": "tester", "REPO_DIRS": f"acme/widgets={clone},acme/gone=/nowhere"})
+        self.root = make_copy(self.tmp, {"MUX": "tos", "GH_USER": "tester",
+                                         "REPO_DIRS": f"acme/widgets={clone},acme/gone=/nowhere"})
 
     def fake(self, name, body):
         with open(os.path.join(self.bin, name), "w") as f:
@@ -278,9 +357,9 @@ class MuxSession:
             self.addCleanup(restore_env, k, old)
         clone = os.path.join(self.tmp, "widgets")
         subprocess.run(["git", "init", "-q", clone], check=True)
-        self.root = make_copy(self.tmp, {"MUX": self.MUX, "SESSION": self.session, "GH_USER": "tester",
-                                         "REPO_DIRS": f"acme/widgets={clone}", "CLOSE_GRACE_SECS": "1",
-                                         "POLL_SECS": "3600"})
+        self.config = {"MUX": self.MUX, "SESSION": self.session, "GH_USER": "tester",
+                       "REPO_DIRS": f"acme/widgets={clone}", "CLOSE_GRACE_SECS": "1", "POLL_SECS": "3600"}
+        self.root = make_copy(self.tmp, self.config)
         with open(os.path.join(self.root, "prbot.py")) as f:
             src = f.read()
         with open(os.path.join(self.root, "prbot.py"), "w") as f:
@@ -312,8 +391,16 @@ class MuxSession:
 
     def test_a_round(self):
         m = self.m
-        # 1. start: a session whose first tab is "home", and the poller's tab.
-        self.assertIn(f"poller started in {self.MUX} session '{self.session}'", self.prbot("start"))
+        # 1. start: a session whose first tab is "home", and the poller's tab. It's typed in a pane of the other
+        #    multiplexer, whose variables must not reach the new session's tabs.
+        other = "zellij" if self.MUX == "tos" else "tos"
+        out = self.prbot("start", env=dict(os.environ, **pane_of(other)))
+        self.assertIn(f"poller started in {self.MUX} session '{self.session}'", out)
+        if os.path.isdir("/proc/self"):
+            pid = wait_for(lambda: poller_pid(self.root))
+            with open(f"/proc/{pid}/environ", "rb") as f:
+                poller_env = dict(v.decode().split("=", 1) for v in f.read().split(b"\0") if b"=" in v)
+            self.assertEqual([k for k in pane_of(other) if k in poller_env], [])
         self.assertEqual(self.names()[0], "home")
         self.assertIn("poller", self.names())
         self.assertIn("poller is already running", self.prbot("start"))
@@ -352,6 +439,38 @@ class MuxSession:
         self.assertIn("poller stopped", r.stdout, r.stderr)
         self.assertNotIn("poller", self.names())
         self.assertIn("poller not running", self.prbot("stop"))
+
+    def test_auto_uses_the_one_you_start_it_in(self):
+        write_config(self.root, dict(self.config, MUX="auto"))
+        other = "zellij" if self.MUX == "tos" else "tos"
+        here, there = dict(os.environ, **pane_of(self.MUX)), dict(os.environ, **pane_of(other))
+        # 1. Typed in a pane of this multiplexer: it uses this one, says why, and remembers it.
+        out = self.prbot("start", env=here)
+        self.assertIn(f"poller started in {self.MUX} session '{self.session}' (MUX=auto: you're in a {self.MUX} pane)",
+                      out)
+        with open(os.path.join(self.root, "mux")) as f:
+            self.assertEqual(f.read().strip(), self.MUX)
+        # 2. Typed in the other one, while the poller runs: it says where, and starts nothing.
+        out = self.prbot("start", env=there)
+        self.assertIn(f"poller is already running in {self.MUX} session '{self.session}'. To move it to {other}", out)
+        self.assertEqual(self.names().count("poller"), 1)
+        # 3. Every other command uses the remembered one, wherever it's typed.
+        self.assertIn("poller stopped", self.prbot("stop", env=there))
+        self.assertNotIn("poller", self.names())
+
+
+def poller_pid(root):
+    """The pid of the poller running from `root`, found through /proc."""
+    want = os.path.join(root, "prbot.py")
+    for pid in os.listdir("/proc"):
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                args = f.read().split(b"\0")
+        except OSError:
+            continue
+        if want.encode() in args and b"poll" in args:
+            return int(pid)
+    return None
 
 
 def restore_env(key, old):

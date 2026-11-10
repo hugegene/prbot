@@ -15,3 +15,6 @@ __pycache__/
 docs/plan-auto-close-and-queue.md
 docs/plan-fix-worktrees.md
 docs/plan-rerev-on-author-replies.md
+
+# Which multiplexer ./bin/start used, for MUX=auto.
+mux

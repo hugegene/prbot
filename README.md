@@ -18,9 +18,9 @@ You need Python 3.9 or later, the [GitHub CLI](https://cli.github.com) logged in
 ```bash
 git clone https://github.com/hugegene/prbot ~/prbot
 cd ~/prbot
-cp config.example.env config.env    # then set REPO_DIRS, and MUX=zellij if that's what you use
+cp config.example.env config.env    # then set REPO_DIRS
 ./bin/prbot check                   # what's missing, plus a test notification
-./bin/start
+./bin/start                         # run it inside tos or zellij: prbot uses that one
 ```
 
 | Tab | When | First message to Claude | Where Claude works |
@@ -93,7 +93,7 @@ every 60s (POLL_SECS)    "since" = last poll − 5 min (LAG_SECS), because searc
 
 ## Start / stop
 
-Run these from your own terminal. With `MUX=zellij`, type `zellij` where these say `tos`: the commands and keys are the same.
+Run these from your own terminal. In zellij, type `zellij` where these say `tos`: the commands and keys are the same.
 ```bash
 cd ~/prbot
 ./bin/start                  # session "prbot" in the background, with the poller in a tab
@@ -102,6 +102,10 @@ tos attach prbot             # look in; switch tabs: Ctrl-t then arrows; detach:
 ./bin/stop                   # stop the poller (open tabs keep running)
 tos kill-session prbot       # stop everything
 ```
+
+**Which multiplexer:** with `MUX=auto` (the default), `./bin/start` uses the one you run it in, and says so: `poller started in zellij session 'prbot' (MUX=auto: you're in a zellij pane)`. It remembers that in the file `mux`, so `./bin/prbot ls` and the rest look in the same place wherever you type them. Run `./bin/start` in the other one while the poller is running, and it tells you where the poller is instead of starting a second one. To move it, `./bin/stop` first; tabs still open in the old one keep running there, but prbot no longer sees them.
+
+Outside both, `auto` uses the only one installed. If both are installed, or you're in one started inside the other, it can't tell and asks you to set `MUX=tos` or `MUX=zellij`. Either setting always wins.
 
 ## By hand
 
@@ -185,7 +189,7 @@ Because `config.env` isn't in git, your messages never conflict with updates you
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `MUX` | `tos` | `tos` or `zellij`: which one holds the tabs |
+| `MUX` | `auto` | `auto`, `tos` or `zellij`: which one holds the tabs (see "Which multiplexer" above) |
 | `SESSION` | `prbot` | the session's name (`ZELLIJ_SESSION` is still read, its old name) |
 | `GH_USER` | (asked from GitHub) | your login, whose requests, PRs and @mentions count |
 | `REPO_DIRS` | (empty), e.g. `acme/widgets=~/src/widgets` | your clone for each repo; repos not listed are skipped |
@@ -210,4 +214,5 @@ Because `config.env` isn't in git, your messages never conflict with updates you
   - `prbot.log`: the log
   - `state.json`: what's been handled, and the queue
   - `worktrees.json`: worktrees fix tabs used
+  - `mux`: which multiplexer `./bin/start` used, for `MUX=auto`
   - `~/.cache/prbot/claude-settings.json`: the generated tab settings (hooks and read-only allows)
