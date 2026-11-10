@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Print a PR's reviews, code threads (resolved/open) and conversation:  pr-threads N [--repo OWNER/REPO]
+exec python3 "$(cd "$(dirname "$0")/.." && pwd)/prbot.py" threads "$@"

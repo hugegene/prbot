@@ -1,0 +1,17 @@
+# Your own settings: your GitHub login, your clones, your ntfy topic. Copy config.example.env to start.
+config.env
+
+# What the poller writes as it runs. These hold PR titles and paths from the repos you watch.
+prbot.log
+state.json
+state.json.tmp
+worktrees.json
+worktrees.json.lock
+worktrees.json.tmp
+
+__pycache__/
+
+# Notes from building prbot against one private repo. They stay on disk, out of git.
+docs/plan-auto-close-and-queue.md
+docs/plan-fix-worktrees.md
+docs/plan-rerev-on-author-replies.md

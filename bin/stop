@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Stop the poller tab. Open Claude tabs keep running. To kill everything: zellij kill-session prbot
+set -euo pipefail
+HERE="$(cd "$(dirname "$0")/.." && pwd)"
+ZELLIJ_SESSION=prbot
+# shellcheck disable=SC1091
+[[ -f "$HERE/config.env" ]] && source "$HERE/config.env"
+id="$(zellij -s "$ZELLIJ_SESSION" action list-tabs -j 2>/dev/null | python3 -c 'import json,sys; print(next((str(t["tab_id"]) for t in json.load(sys.stdin) if t["name"]=="poller"), ""))')"
+if [[ -n "$id" ]]; then zellij -s "$ZELLIJ_SESSION" action close-tab-by-id "$id"; echo "poller stopped"; else echo "poller not running"; fi

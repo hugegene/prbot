@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Start the zellij session "prbot" in the background with the poller in its own tab.
+# Extra args go to the poller, e.g.  ./bin/start --dry-run
+set -euo pipefail
+HERE="$(cd "$(dirname "$0")/.." && pwd)"
+ZELLIJ_SESSION=prbot
+# shellcheck disable=SC1091
+[[ -f "$HERE/config.env" ]] && source "$HERE/config.env"
+S="$ZELLIJ_SESSION"
+# Don't pass a Claude session's own variables on to the zellij session (same list as LEAKY_ENV in prbot.py).
+# Otherwise, when this runs from inside Claude, a `claude` started in any pane thinks it's a child session
+# and doesn't save its transcript.
+unset CLAUDECODE CLAUDE_CODE_CHILD_SESSION CLAUDE_CODE_SESSION_ID CLAUDE_CODE_BRIDGE_SESSION_ID \
+  CLAUDE_CODE_MESSAGING_SOCKET CLAUDE_CODE_MESSAGING_TOKEN CLAUDE_CODE_SESSION_ATTENDED \
+  CLAUDE_CODE_ENTRYPOINT CLAUDE_CODE_EXECPATH CLAUDE_CODE_SSE_PORT CLAUDE_PID CLAUDE_EFFORT
+
+line="$(zellij list-sessions -n 2>/dev/null | awk -v s="$S" '$1==s' || true)"
+if [[ "$line" == *EXITED* ]]; then zellij delete-session "$S" >/dev/null; line=""; fi
+if [[ -z "$line" ]]; then
+  zellij attach --create-background "$S"
+  for _ in $(seq 20); do zellij -s "$S" action query-tab-names >/dev/null 2>&1 && break; sleep 0.25; done
+  zellij -s "$S" action rename-tab-by-id 0 home >/dev/null 2>&1 || true
+fi
+
+if zellij -s "$S" action query-tab-names | grep -qx poller; then
+  echo "poller is already running in session '$S'"
+else
+  zellij -s "$S" action new-tab -n poller -c "$HERE" -- python3 "$HERE/prbot.py" poll "$@" >/dev/null
+  echo "poller started in session '$S'"
+fi
+echo "attach:  zellij attach $S      (detach: Ctrl-o d)"

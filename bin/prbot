@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# prbot CLI: ls, new-job, threads, poll ... (see: ./bin/prbot -h)
+exec python3 "$(cd "$(dirname "$0")/.." && pwd)/prbot.py" "$@"

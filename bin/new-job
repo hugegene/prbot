@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Open a tab by hand:  new-job review 485 | new-job rereview 485 | new-job fix 490 | new-job reply <comment URL>
+exec python3 "$(cd "$(dirname "$0")/.." && pwd)/prbot.py" new-job "$@"
