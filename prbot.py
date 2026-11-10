@@ -22,6 +22,7 @@ Commands:
   hook EVENT                                 internal: Claude Code hook
 """
 import argparse
+import collections
 import contextlib
 import datetime as dt
 import fcntl
@@ -94,12 +95,18 @@ CFG = load_config()
 # The multiplexer prbot drives. Both take the same commands; only the program and the variables it sets in each
 # pane differ: (the pane's id, the session's name).
 MUXES = {"tos": ("TOS_PANE_ID", "TOS_SESSION"), "zellij": ("ZELLIJ_PANE_ID", "ZELLIJ_SESSION_NAME")}
-MUX_FILE = os.path.join(HERE, "mux")  # the one ./bin/start used, for MUX=auto (git ignores it)
-MUX_SETTING = CFG["MUX"].strip().lower()
+OWN_SESSION = "prbot"  # prbot's own session, for ./bin/start typed outside any session
+STARTED_FILE = os.path.join(HERE, "started")  # where ./bin/start put the poller: multiplexer, then session
+MUX_SETTING = CFG["MUX"].strip().lower() or "auto"
 if MUX_SETTING not in (*MUXES, "auto"):
     sys.exit(f"prbot: MUX={CFG['MUX']} in config.env; use auto, tos or zellij")
+SESSION_SETTING = (CFG["SESSION"] or CFG["ZELLIJ_SESSION"]).strip() or "auto"  # ZELLIJ_SESSION: its old name
 NO_MUX = ("can't tell whether to use tos or zellij (MUX=auto in config.env). Run ./bin/start inside the one you "
           "want, or set MUX=tos or MUX=zellij")
+# Where prbot works. Decided at the end of this file (use(choose())), once the helpers it needs are defined.
+MUX = SESSION = PANE_VAR = SESSION_VAR = None
+OWNED = True  # prbot may start and delete SESSION: its own, or one named in config.env. Never one of your panes'.
+WHY = ""  # how MUX and SESSION were chosen, for start and check
 
 
 def pane_mux():
@@ -109,14 +116,31 @@ def pane_mux():
     return inside[0] if len(inside) == 1 else None
 
 
-def remembered_mux():
-    """The multiplexer ./bin/start last used, if any."""
+def pane_session():
+    """The session of the pane this runs in, or None (outside both, or inside both)."""
+    here = pane_mux()
+    return os.environ.get(MUXES[here][1]) if here else None
+
+
+def started():
+    """(multiplexer, session) where ./bin/start last put the poller, or (None, None). A file from before sessions
+    were remembered has only the multiplexer, and then the session was prbot's own."""
     try:
-        with open(MUX_FILE) as f:
-            name = f.read().strip()
+        with open(STARTED_FILE) as f:
+            lines = [line.strip() for line in f.read().splitlines()]
     except OSError:
-        return None
-    return name if name in MUXES else None
+        return None, None
+    if not lines or lines[0] not in MUXES:
+        return None, None
+    return lines[0], (lines[1] if len(lines) > 1 and lines[1] else OWN_SESSION)
+
+
+def running_sessions(name):
+    """The sessions of `name` (tos or zellij) that are running, not exited; none if it isn't installed."""
+    if not shutil.which(name):
+        return []
+    r = run_mux(name, "list-sessions", "-n")
+    return [line.split()[0] for line in r.stdout.splitlines() if line.split() and "EXITED" not in line]
 
 
 def installed_mux():
@@ -125,27 +149,55 @@ def installed_mux():
     return found[0] if len(found) == 1 else None
 
 
-def choose_mux():
-    """(the multiplexer or None, how it was chosen). MUX=tos or MUX=zellij always wins. With MUX=auto: the one
-    ./bin/start remembered, else the one whose pane this runs in, else the only one installed."""
+Choice = collections.namedtuple("Choice", "mux session owned why")
+
+
+def choose(for_start=False):
+    """Where prbot works. Settings in config.env always win. With auto, in this order: where ./bin/start last put
+    the poller (except for start itself), the pane this runs in, then prbot's own session, outside any session.
+    There, MUX=auto takes the multiplexer whose prbot session is running, else the only one installed."""
+    old_mux, old_session = (None, None) if for_start else started()
+    here, here_session = pane_mux(), pane_session()
+    remembered = "where ./bin/start put it"
     if MUX_SETTING != "auto":
-        return MUX_SETTING, f"MUX={MUX_SETTING} in config.env"
-    for name, how in ((remembered_mux(), "remembered from ./bin/start"), (pane_mux(), "you're in a {} pane"),
-                      (installed_mux(), "the only one installed")):
-        if name:
-            return name, "MUX=auto: " + how.format(name)
-    return None, "MUX=auto"
+        name, mux_why = MUX_SETTING, f"MUX={MUX_SETTING} in config.env"
+    elif old_mux:
+        name, mux_why = old_mux, remembered
+    elif here:
+        name, mux_why = here, f"you're in a {here} pane"
+    else:
+        with_own = [m for m in MUXES if OWN_SESSION in running_sessions(m)]
+        if len(with_own) == 1:
+            name, mux_why = with_own[0], f"its session is running in {with_own[0]}"
+        else:
+            name, mux_why = installed_mux(), "the only multiplexer installed"
+        if name is None:
+            return Choice(None, None, True, "MUX=auto")
+    if SESSION_SETTING != "auto":
+        session, owned, session_why = SESSION_SETTING, True, f"SESSION={SESSION_SETTING} in config.env"
+    elif old_mux == name:
+        session, owned, session_why = old_session, old_session == OWN_SESSION, remembered
+    elif name == here and here_session:
+        session, owned, session_why = here_session, here_session == OWN_SESSION, "you're in it"
+    else:
+        session, owned, session_why = OWN_SESSION, True, "outside any session, so prbot's own"
+    if session_why == "you're in it" and mux_why.startswith("you're in"):
+        why = session_why  # both from your pane
+    elif mux_why == session_why:
+        why = mux_why
+    elif session_why.startswith("outside"):
+        why = f"{session_why}; {mux_why}"
+    else:
+        why = f"{mux_why}; {session_why}"
+    return Choice(name, session, owned, why)
 
 
-def use_mux(name):
-    global MUX, PANE_VAR, SESSION_VAR
-    MUX = name
-    PANE_VAR, SESSION_VAR = MUXES[name] if name else (None, None)
+def use(choice):
+    global MUX, SESSION, PANE_VAR, SESSION_VAR, OWNED, WHY
+    MUX, SESSION, OWNED, WHY = choice.mux, choice.session, choice.owned, choice.why
+    PANE_VAR, SESSION_VAR = MUXES[MUX] if MUX else (None, None)
 
 
-MUX, MUX_HOW = choose_mux()
-use_mux(MUX)
-SESSION = CFG["SESSION"] or CFG["ZELLIJ_SESSION"] or "prbot"  # ZELLIJ_SESSION: the setting's old name
 TOS_API = 2  # the oldest tos extension API prbot works with: TOS_PANE_ID and TOS_SESSION came in API 2
 
 
@@ -481,13 +533,17 @@ def discover(state):
 PANE_VARS = {v for names in MUXES.values() for v in names} | {"ZELLIJ"}
 
 
+def run_mux(name, *args):
+    """Runs `name` (tos or zellij) without the Claude variables or your pane's, so neither reaches its panes."""
+    env = {k: v for k, v in clean_env().items() if k not in PANE_VARS}
+    return subprocess.run([name, *args], capture_output=True, text=True, env=env)
+
+
 def mux(*args):
-    """Runs the multiplexer (tos or zellij) without the Claude variables or your pane's, so neither reaches its
-    panes."""
+    """Runs the multiplexer prbot works in."""
     if MUX is None:
         die(NO_MUX)
-    env = {k: v for k, v in clean_env().items() if k not in PANE_VARS}
-    return subprocess.run([MUX, *args], capture_output=True, text=True, env=env)
+    return run_mux(MUX, *args)
 
 
 def zj(*args, session=None):
@@ -500,9 +556,13 @@ def session_running():
 
 
 def ensure_session():
-    """Starts the session in the background if it isn't running. Its first tab is named home."""
+    """Starts prbot's session in the background if it isn't running, with its first tab named home. A session taken
+    from your pane is never started, deleted or renamed: if it isn't running, that's an error."""
     if session_running():
         return
+    if not OWNED:
+        raise RuntimeError(f"{MUX} session '{SESSION}' isn't running, and prbot doesn't start or delete your own "
+                           f"sessions. Run ./bin/start in a session that's running")
     mux("delete-session", SESSION)
     mux("attach", "--create-background", SESSION)
     for _ in range(20):
@@ -978,26 +1038,26 @@ def poller_tab():
 
 
 def cmd_start(a):
-    how = ""
-    if MUX_SETTING == "auto":
-        here = pane_mux()
-        old = remembered_mux()
-        if old and shutil.which(old):  # the poller may be running there, even if you're typing in the other one
-            use_mux(old)
-            if session_running() and poller_tab():
-                move = f" To move it to {here}: ./bin/stop, then ./bin/start again." if here and here != old else ""
-                print(f"poller is already running in {MUX} session '{SESSION}'.{move}")
-                print(f"attach:  {MUX} attach {SESSION}      (detach: Ctrl-o d)")
-                return
-        name = here or installed_mux()
-        if not name:
-            die(NO_MUX)
-        use_mux(name)
-        how = f" (MUX=auto: you're in a {name} pane)" if name == here else " (MUX=auto: the only one installed)"
+    new = choose(for_start=True)
+    old_mux, old_session = started()
+    if old_mux and shutil.which(old_mux):  # the poller may be running there, even if you're typing somewhere else
+        use(Choice(old_mux, old_session, old_session == OWN_SESSION, "where ./bin/start put it"))
+        if session_running() and poller_tab():
+            move = ""
+            if new.mux and (new.mux, new.session) != (old_mux, old_session):
+                move = f" To move it to {new.mux} session '{new.session}': ./bin/stop, then ./bin/start again."
+            print(f"poller is already running in {MUX} session '{SESSION}'.{move}")
+            return
+    if new.mux is None:
+        die(NO_MUX)
+    use(new)
     problem = mux_problem()
     if problem:
         die(problem)
-    ensure_session()
+    try:
+        ensure_session()
+    except RuntimeError as e:
+        die(str(e))
     if poller_tab():
         print(f"poller is already running in {MUX} session '{SESSION}'")
     else:
@@ -1006,10 +1066,11 @@ def cmd_start(a):
                *poll_args)
         if r.returncode != 0:
             die(f"{MUX} new-tab failed: {r.stderr.strip()}")
-        print(f"poller started in {MUX} session '{SESSION}'{how}")
-    with open(MUX_FILE, "w") as f:  # every other command uses this one from now on
-        f.write(MUX + "\n")
-    print(f"attach:  {MUX} attach {SESSION}      (detach: Ctrl-o d)")
+        print(f"poller started in {MUX} session '{SESSION}' ({WHY})")
+    with open(STARTED_FILE, "w") as f:  # every other command works here from now on
+        f.write(f"{MUX}\n{SESSION}\n")
+    if OWNED:
+        print(f"attach:  {MUX} attach {SESSION}      (detach: Ctrl-o d)")
 
 
 def cmd_stop(a):
@@ -1018,7 +1079,10 @@ def cmd_stop(a):
         print("poller not running")
         return
     zj("close-tab-by-id", str(tab["tab_id"]))
-    print(f"poller stopped. Open Claude tabs keep running; to end everything: {MUX} kill-session {SESSION}")
+    if OWNED:
+        print(f"poller stopped. Open Claude tabs keep running; to end everything: {MUX} kill-session {SESSION}")
+    else:
+        print(f"poller stopped. Open Claude tabs keep running in your {MUX} session '{SESSION}'.")
 
 
 def cmd_check(a):
@@ -1034,7 +1098,7 @@ def cmd_check(a):
     line(v >= (3, 9), "python", f"{v.major}.{v.minor}.{v.micro} (3.9 or later)")
     problem = NO_MUX if MUX is None else mux_problem()
     detail = f"{MUX}, session '{SESSION}'" + (f" ({tos_api()[1]})" if MUX == "tos" and not problem else "")
-    line(problem is None, "multiplexer", problem or f"{detail} ({MUX_HOW})")
+    line(problem is None, "multiplexer", problem or f"{detail} ({WHY})")
     r = subprocess.run(["gh", "auth", "token"], capture_output=True, text=True) if shutil.which("gh") else None
     if r is None or r.returncode != 0 or not r.stdout.strip():
         line(False, "gh", "not installed" if r is None else "not logged in: run gh auth login")
@@ -1091,7 +1155,10 @@ def cmd_new_job(a):
     t = task(a.kind, repo, n, pr["title"], [], extra)
     if find_tab(tab_name(t)):
         die(f"tab {tab_name(t)} is already open")
-    spawn(t)
+    try:
+        spawn(t)
+    except RuntimeError as e:
+        die(str(e))
     print(f"opened tab {tab_name(t)} in {MUX} session '{SESSION}'. Attach with: {MUX} attach {SESSION}")
 
 
@@ -1320,6 +1387,10 @@ def cmd_hook(a):
     if tab is not None:
         zj("rename-tab-by-id", str(tab), "* " + name)
     notify(f"prbot: {name} is ready for you")
+
+
+# Where prbot works: decided here, once everything it needs is defined.
+use(choose())
 
 
 def main():
