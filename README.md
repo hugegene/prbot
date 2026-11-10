@@ -1,6 +1,27 @@
 # prbot
 
-Watches GitHub every minute. When a PR needs you, it opens a zellij tab with Claude in your own clone of the repo and gives Claude a one-line instruction. Claude uses the repo's own `CLAUDE.md` and skills, such as `/review`. Each message tells Claude to wait for you before posting or pushing.
+Watches GitHub every minute. When a PR needs you, it opens a tab with Claude in your own clone of the repo and gives Claude a one-line instruction. Claude uses the repo's own `CLAUDE.md` and skills, such as `/review`. Each message tells Claude to wait for you before posting or pushing.
+
+The tabs live in a background session of [tos](https://github.com/hugegene/termos) or [zellij](https://zellij.dev), whichever you choose. prbot is an example of a tos extension: an ordinary program that drives tos through its command line. tos copied zellij's commands, so the same script drives both.
+
+```
+ ┌────────┐ 1. search, every 60 s  ┌──────────────────────┐ 2. tos -s prbot action new-tab -n rev-487 …  ┌──────────────────────┐
+ │ GitHub │ ◀───────────────────── │ poller tab:          │ ───────────────────────────────────────────▶ │ session "prbot"      │
+ └────────┘                        │ python3 prbot.py poll│                                              │  tab rev-487: claude │
+                                   └──────────────────────┘                                              └──────────────────────┘
+```
+
+## Setup
+
+You need Python 3.9 or later, the [GitHub CLI](https://cli.github.com) logged in (`gh auth login`), [Claude Code](https://claude.com/claude-code), and either tos (0.2.0 or later) or zellij. It runs on Linux and macOS.
+
+```bash
+git clone https://github.com/hugegene/prbot ~/prbot
+cd ~/prbot
+cp config.example.env config.env    # then set REPO_DIRS, and MUX=zellij if that's what you use
+./bin/prbot check                   # what's missing, plus a test notification
+./bin/start
+```
 
 | Tab | When | First message to Claude | Where Claude works |
 |---|---|---|---|
@@ -67,18 +88,19 @@ every 60s (POLL_SECS)    "since" = last poll − 5 min (LAG_SECS), because searc
         author-reply rerev: you've reviewed or commented since ─────────── drop
         a review, but you'd reviewed this PR before ────────────────────── becomes rerev-N
                                 ▼
-              open a zellij tab: rev-N / rerev-N / fix-N / re-N
+              open a tab: rev-N / rerev-N / fix-N / re-N
 ```
 
 ## Start / stop
 
-Run these from your own terminal:
+Run these from your own terminal. With `MUX=zellij`, type `zellij` where these say `tos`: the commands and keys are the same.
 ```bash
-cd ~/claudehook
-./bin/start                  # zellij session "prbot" with the poller in a tab
-zellij attach prbot          # look in; switch tabs: Ctrl-t then arrows; detach: Ctrl-o d
+cd ~/prbot
+./bin/start                  # session "prbot" in the background, with the poller in a tab
+./bin/start --dry-run        # the same, but the poller only logs what it would open
+tos attach prbot             # look in; switch tabs: Ctrl-t then arrows; detach: Ctrl-o d
 ./bin/stop                   # stop the poller (open tabs keep running)
-zellij kill-session prbot    # stop everything
+tos kill-session prbot       # stop everything
 ```
 
 ## By hand
@@ -88,6 +110,7 @@ zellij kill-session prbot    # stop everything
 ./bin/new-job rereview 487
 ./bin/new-job fix 490
 ./bin/new-job reply 'https://github.com/acme/widgets/pull/452#issuecomment-1234567890'
+./bin/prbot check            # what's installed and set up, and a test notification
 ./bin/prbot ls               # open prbot tabs and anything queued
 ./bin/pr-threads 487         # a PR's reviews, code threads (open/resolved) and conversation
 ./bin/prbot cleanup --dry-run   # which worktrees have a merged PR and could go
@@ -137,10 +160,34 @@ Your repo squash-merges, so prbot checks that a PR merged on GitHub; git alone c
 
 `./bin/prbot cleanup` applies the same checks to **every** worktree in your clone, including ones you made yourself. Run it with `--dry-run` first.
 
+## Changing the first messages
+
+Each kind of tab starts Claude with one message. Yours can replace any of them in `config.env`, one line each:
+
+```bash
+MESSAGE_REVIEW=Review PR #{n} with /review, and wait for me before posting anything to GitHub.
+```
+
+For PR 487 that tab starts with "Review PR #487 with /review, and wait for me before posting anything to GitHub.", followed by the sentence prbot always adds: *When I say "close the tab", run …/bin/prbot done …*. That sentence can't be replaced, because closing the tab depends on it.
+
+| Setting | Kind of tab | Placeholders that mean something there |
+|---|---|---|
+| `MESSAGE_REVIEW` | `rev-N` | `{n}`, `{prbot}` |
+| `MESSAGE_REREVIEW` | `rerev-N` | `{n}`, `{intro}` (why the tab opened), `{sha}` (the commit your last review was on), `{prbot}` |
+| `MESSAGE_FIX` | `fix-N` | `{n}`, `{note}` (the worktree's state, often empty), `{prbot}` |
+| `MESSAGE_REPLY` | `re-N` | `{n}`, `{url}` (the comment you were mentioned in), `{prbot}` |
+
+`{prbot}` is this folder, for `{prbot}/bin/pr-threads {n}`. Write `{{` and `}}` for braces. The defaults are in `config.example.env`. A message prbot can't fill in is shown in its tab instead of starting Claude.
+
+Because `config.env` isn't in git, your messages never conflict with updates you pull.
+
 ## Config (`config.env`)
 
 | Setting | Default | Meaning |
 |---|---|---|
+| `MUX` | `tos` | `tos` or `zellij`: which one holds the tabs |
+| `SESSION` | `prbot` | the session's name (`ZELLIJ_SESSION` is still read, its old name) |
+| `GH_USER` | (asked from GitHub) | your login, whose requests, PRs and @mentions count |
 | `REPO_DIRS` | (empty), e.g. `acme/widgets=~/src/widgets` | your clone for each repo; repos not listed are skipped |
 | `PERMISSION_MODE` | `auto` | `auto` or `manual`; the bypass modes are refused |
 | `MAX_JOBS` | `3` | most tabs open at once; the rest wait |
@@ -149,12 +196,16 @@ Your repo squash-merges, so prbot checks that a PR merged on GitHub; git alone c
 | `IGNORE_AUTHORS` | `Copilot` | logins to ignore; bot accounts are always ignored |
 | `CLAUDE_EFFORT` | `medium` | effort for prbot tabs only (`claude --effort`); Claude elsewhere keeps your default |
 | `CLAUDE_MODEL`, `NTFY_TOPIC` | (empty) | optional model; optional phone notifications via ntfy.sh |
+| `MESSAGE_REVIEW`, `MESSAGE_REREVIEW`, `MESSAGE_FIX`, `MESSAGE_REPLY` | (prbot's own) | see "Changing the first messages" |
 
 ## Notes
 
 - **GitHub access:** prbot reads GitHub with your `gh` login, via search (fine-grained tokens can't use the notifications API). The token needs Contents: Read and Pull requests: Read and write.
 - **First run:** pending review requests open at once. Comments and mentions count from when the poller first starts. `state.json` remembers what has been handled.
 - **One tab per PR:** if a tab for that PR is already open, new activity waits until it closes.
+- **Desktop notifications:** `notify-send` on Linux, `osascript` on macOS. macOS may ask once whether to allow them.
+- **Before cleanup removes a worktree,** it checks that nothing is running inside it: through `/proc` on Linux, `lsof` on macOS. If it can't tell, it keeps the worktree and says why.
+- **Tests:** `python3 -m unittest discover -s tests -v`. They use a copy of prbot and throwaway sessions, so your config, state and sessions are never touched. The tos and zellij rounds are skipped when that program isn't installed.
 - **Files:**
   - `prbot.log`: the log
   - `state.json`: what's been handled, and the queue

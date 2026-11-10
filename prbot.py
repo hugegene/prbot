@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""prbot: watch GitHub for PRs that need you and open a Claude tab in zellij for each.
+"""prbot: watch GitHub for PRs that need you and open a Claude tab for each, in tos or zellij (MUX).
 
   rev-N    your review was requested                 -> "Review PR #N."
   rerev-N  re-requested, or the author replied to you -> check your comments are resolved
@@ -7,10 +7,13 @@
   re-N     you were @mentioned on someone else's PR  -> draft a reply
 
 Claude starts in your own clone (REPO_DIRS), so it uses the repo's CLAUDE.md and skills.
-Posting or pushing (gh pr review/comment, gh api, git push) always needs your OK in the tab.
+Each first message tells Claude to wait for you before posting or pushing.
 
 Commands:
-  poll [--dry-run] [--once] [--since ISO]   poller loop (bin/start runs it in a tab)
+  start [--dry-run] [--since ISO]            the session, with the poller in its own tab (bin/start)
+  stop                                       close the poller's tab; open Claude tabs keep running (bin/stop)
+  check                                      what's installed and set up, and a test notification
+  poll [--dry-run] [--once] [--since ISO]   poller loop (start runs it in a tab)
   new-job KIND N|URL [--repo OWNER/REPO]     open a tab by hand (KIND: review rereview fix reply)
   ls                                         prbot tabs and the queue
   threads N [--repo OWNER/REPO]              print a PR's reviews and comment threads
@@ -25,6 +28,8 @@ import fcntl
 import json
 import os
 import re
+import shutil
+import string
 import subprocess
 import sys
 import time
@@ -42,7 +47,7 @@ KINDS = {"review": "rev", "rereview": "rerev", "fix": "fix", "reply": "re"}
 PRIORITY = ["review", "rereview", "fix", "reply"]
 
 MESSAGES = {
-    "review": "Review PR #{n}. Skip reading in /review. Wait for me before posting anything to GitHub.",
+    "review": "Review PR #{n}. Wait for me before posting anything to GitHub.",
     "rereview": "{intro} Pull the PR and check whether the author's replies and any new commits resolve my review "
                 "comments (my last review was on commit {sha}; threads: {prbot}/bin/pr-threads {n}). "
                 "Wait for me before posting anything to GitHub.",
@@ -51,6 +56,16 @@ MESSAGES = {
     "reply": "I was mentioned on PR #{n}: {url} (threads: {prbot}/bin/pr-threads {n}). "
              "Draft my reply and wait for me before posting it.",
 }
+# What a message can use, filled in when its tab starts. config.env can replace each message (MESSAGE_REVIEW, ...).
+PLACEHOLDERS = {
+    "n": "the PR number",
+    "url": "the comment you were mentioned in (reply)",
+    "sha": "the commit your last review was on (rereview)",
+    "intro": "why a rereview tab opened, as a sentence (rereview)",
+    "note": "a sentence about the worktree's state, often empty (fix)",
+    "prbot": "this folder, for bin/pr-threads",
+}
+# Always added after the message, from config.env or not: closing the tab depends on it.
 DONE_CLAUSE = (' When I say "close the tab", run {prbot}/bin/prbot done after everything else I asked for '
                "in that message (such as posting) has succeeded.")
 
@@ -58,9 +73,9 @@ DONE_CLAUSE = (' When I say "close the tab", run {prbot}/bin/prbot done after ev
 # ---------------------------------------------------------------- config / log
 
 def load_config():
-    cfg = {"GH_USER": "", "POLL_SECS": "60", "MAX_JOBS": "3", "LAG_SECS": "300", "ZELLIJ_SESSION": "prbot",
-           "CLAUDE_MODEL": "", "NTFY_TOPIC": "", "IGNORE_AUTHORS": "Copilot", "PERMISSION_MODE": "auto",
-           "REPO_DIRS": "", "CLOSE_GRACE_SECS": "15", "CLAUDE_EFFORT": ""}
+    cfg = {"GH_USER": "", "POLL_SECS": "60", "MAX_JOBS": "3", "LAG_SECS": "300", "MUX": "tos", "SESSION": "",
+           "ZELLIJ_SESSION": "", "CLAUDE_MODEL": "", "NTFY_TOPIC": "", "IGNORE_AUTHORS": "Copilot",
+           "PERMISSION_MODE": "auto", "REPO_DIRS": "", "CLOSE_GRACE_SECS": "15", "CLAUDE_EFFORT": ""}
     path = os.path.join(HERE, "config.env")
     if os.path.exists(path):
         with open(path) as f:
@@ -68,12 +83,23 @@ def load_config():
                 line = line.strip()
                 if line and not line.startswith("#") and "=" in line:
                     k, v = line.split("=", 1)
-                    cfg[k.strip()] = v.strip().strip('"').strip("'")
+                    v = v.strip()
+                    if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":  # one pair of quotes around it
+                        v = v[1:-1]
+                    cfg[k.strip()] = v
     return cfg
 
 
 CFG = load_config()
-SESSION = CFG["ZELLIJ_SESSION"]
+# The multiplexer prbot drives. Both take the same commands; only the program and the variables it sets in each
+# pane differ: (the pane's id, the session's name).
+MUXES = {"tos": ("TOS_PANE_ID", "TOS_SESSION"), "zellij": ("ZELLIJ_PANE_ID", "ZELLIJ_SESSION_NAME")}
+MUX = CFG["MUX"].lower()
+if MUX not in MUXES:
+    sys.exit(f"prbot: MUX={CFG['MUX']} in config.env; use tos or zellij")
+PANE_VAR, SESSION_VAR = MUXES[MUX]
+SESSION = CFG["SESSION"] or CFG["ZELLIJ_SESSION"] or "prbot"  # ZELLIJ_SESSION: the setting's old name
+TOS_API = 2  # the oldest tos extension API prbot works with: TOS_PANE_ID and TOS_SESSION came in API 2
 
 
 def log(msg):
@@ -400,27 +426,36 @@ def discover(state):
     return list(found.values())
 
 
-# ---------------------------------------------------------------- zellij
+# ---------------------------------------------------------------- tos or zellij
+
+def mux(*args):
+    """Runs the multiplexer (tos or zellij) without the Claude variables, so they never reach its panes."""
+    return subprocess.run([MUX, *args], capture_output=True, text=True, env=clean_env())
+
 
 def zj(*args, session=None):
-    return subprocess.run(["zellij", "-s", session or SESSION, "action", *args], capture_output=True, text=True)
+    return mux("-s", session or SESSION, "action", *args)
 
 
 def session_running():
-    r = subprocess.run(["zellij", "list-sessions", "-n"], capture_output=True, text=True)
+    r = mux("list-sessions", "-n")
     return any(l.split()[0] == SESSION and "EXITED" not in l for l in r.stdout.splitlines() if l.split())
 
 
 def ensure_session():
+    """Starts the session in the background if it isn't running. Its first tab is named home."""
     if session_running():
         return
-    subprocess.run(["zellij", "delete-session", SESSION], capture_output=True)
-    subprocess.run(["zellij", "attach", "--create-background", SESSION], capture_output=True, env=clean_env())
+    mux("delete-session", SESSION)
+    mux("attach", "--create-background", SESSION)
     for _ in range(20):
-        if session_running():
+        if session_running() and zj("list-tabs", "-j").returncode == 0:
+            first = next(iter(list_tabs()), None)
+            if first is not None:
+                zj("rename-tab-by-id", str(first["tab_id"]), "home")
             return
         time.sleep(0.25)
-    raise RuntimeError(f"could not start zellij session {SESSION}")
+    raise RuntimeError(f"could not start {MUX} session {SESSION}")
 
 
 def list_tabs():
@@ -451,8 +486,8 @@ def find_tab(name):
 def own_tab_id():
     """The tab this process runs in, found through its own pane; None outside the prbot session.
     Never look a tab up by name here: another tab can have the same name."""
-    pane = os.environ.get("ZELLIJ_PANE_ID")
-    if not pane or os.environ.get("ZELLIJ_SESSION_NAME") != SESSION:
+    pane = os.environ.get(PANE_VAR)
+    if not pane or os.environ.get(SESSION_VAR) != SESSION:
         return None
     try:
         panes = json.loads(zj("list-panes", "-j", "-t").stdout)
@@ -467,14 +502,23 @@ def spawn(t):
     r = zj("new-tab", "-n", tab_name(t), "-c", repo_dir(t["repo"]), "--",
            os.path.join(HERE, "bin", "run-claude"), t["kind"], t["repo"], str(t["number"]), *t["extra"])
     if r.returncode != 0:
-        raise RuntimeError(f"zellij new-tab failed: {r.stderr.strip()}")
+        raise RuntimeError(f"{MUX} new-tab failed: {r.stderr.strip()}")
     if focused is not None:  # don't pull you out of the tab you're in
         zj("go-to-tab-by-id", str(focused))
 
 
+def desktop_notification(title, body):
+    """The command that shows a desktop notification: osascript on macOS, notify-send elsewhere. The texts go in as
+    arguments, never into the script, so quotes in a PR title can't break it."""
+    if sys.platform == "darwin":
+        return ["osascript", "-e", "on run argv", "-e",
+                "display notification (item 2 of argv) with title (item 1 of argv)", "-e", "end run", title, body]
+    return ["notify-send", "-a", "prbot", title, body]
+
+
 def notify(title, body=""):
     try:
-        subprocess.run(["notify-send", "-a", "prbot", title, body], capture_output=True, timeout=5)
+        subprocess.run(desktop_notification(title, body), capture_output=True, timeout=5)
     except (OSError, subprocess.TimeoutExpired):
         pass
     if CFG["NTFY_TOPIC"]:
@@ -570,9 +614,9 @@ def launch_pending(state):
 
 # ---------------------------------------------------------------- Claude settings
 
-# Variables a Claude session sets for the commands it runs. If they reach the zellij session (prbot started from
-# inside Claude), every pane inherits them, and a `claude` started there thinks it's a child session: it doesn't
-# save its transcript and points at the old session's socket. bin/start unsets the same list.
+# Variables a Claude session sets for the commands it runs. If they reach the session (prbot started from inside
+# Claude), every pane inherits them, and a `claude` started there thinks it's a child session: it doesn't save its
+# transcript and points at the old session's socket. mux() leaves them out.
 LEAKY_ENV = ("CLAUDECODE", "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_BRIDGE_SESSION_ID",
              "CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_MESSAGING_TOKEN", "CLAUDE_CODE_SESSION_ATTENDED",
              "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_EXECPATH", "CLAUDE_CODE_SSE_PORT", "CLAUDE_PID", "CLAUDE_EFFORT")
@@ -705,19 +749,50 @@ def prepare_fix_worktree(repo, n):
     return path, note
 
 
-def processes_inside(path):
-    """True if any process (a shell, an editor, a Claude session) has its working folder inside path."""
+def process_check_method():
+    """How prbot sees other processes' working folders: Linux's /proc, else lsof (macOS has it), else None."""
+    if os.path.isdir("/proc/self"):
+        return "proc"
+    return "lsof" if shutil.which("lsof") else None
+
+
+def process_cwds(method=None):
+    """The working folder of each of your other processes, or None if there's no way to tell."""
+    method = method or process_check_method()
+    me = os.getpid()
+    out = []
+    if method == "proc":
+        for pid in os.listdir("/proc"):
+            if pid.isdigit() and int(pid) != me:
+                try:
+                    out.append(os.path.realpath(os.readlink(f"/proc/{pid}/cwd")))
+                except OSError:
+                    pass
+        return out
+    if method != "lsof":
+        return None
+    try:  # -F: one field per line, "p<pid>" then "n<folder>"
+        r = subprocess.run(["lsof", "-a", "-u", str(os.getuid()), "-d", "cwd", "-Fpn"],
+                           capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    pid = None
+    for line in r.stdout.splitlines():
+        if line.startswith("p") and line[1:].isdigit():
+            pid = int(line[1:])
+        elif line.startswith("n") and pid not in (None, me):
+            out.append(os.path.realpath(line[1:]))
+    return out if pid is not None else None  # nothing listed, not even lsof's caller: it didn't work
+
+
+def processes_inside(path, method=None):
+    """True if any process (a shell, an editor, a Claude session) has its working folder inside path; None if
+    there's no way to tell."""
     path = os.path.realpath(path)
-    for pid in os.listdir("/proc"):
-        if not pid.isdigit() or int(pid) == os.getpid():
-            continue
-        try:
-            cwd = os.path.realpath(os.readlink(f"/proc/{pid}/cwd"))
-        except OSError:
-            continue
-        if cwd == path or cwd.startswith(path + os.sep):
-            return True
-    return False
+    cwds = process_cwds(method)
+    if cwds is None:
+        return None
+    return any(cwd == path or cwd.startswith(path + os.sep) for cwd in cwds)
 
 
 def cleanup_decision(repo, branch, path):
@@ -744,7 +819,10 @@ def cleanup_decision(repo, branch, path):
         return "keep", pr, "it has uncommitted changes or untracked files"
     if any(int(m.group(2)) == pr["number"] for _, m in prbot_tabs()):
         return "keep", pr, "a prbot tab for it is open"
-    if processes_inside(path):
+    busy = processes_inside(path)
+    if busy is None:
+        return "keep", pr, "can't tell whether something is running inside it (no /proc, and lsof isn't installed)"
+    if busy:
         return "keep", pr, "something is running inside it (a shell or Claude session?)"
     return "remove", pr, ""
 
@@ -817,6 +895,101 @@ def cmd_poll(a):
         time.sleep(int(CFG["POLL_SECS"]))
 
 
+def tos_api():
+    """The extension API version of the installed tos, from `tos --version` ("tos 0.3.1 (extension API 2)")."""
+    try:
+        r = subprocess.run(["tos", "--version"], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None, "tos isn't installed"
+    m = re.search(r"extension API (\d+)", r.stdout)
+    return (int(m.group(1)) if m else None), (r.stdout.strip() or r.stderr.strip())
+
+
+def mux_problem():
+    """Why prbot can't drive the multiplexer, or None if it can."""
+    if not shutil.which(MUX):
+        return f"{MUX} isn't installed (MUX={MUX} in config.env)"
+    if MUX == "tos":
+        api, version = tos_api()
+        if api is None or api < TOS_API:
+            return f"prbot needs tos with extension API {TOS_API} or later, and this one says: {version}. Run: tos update"
+    return None
+
+
+def poller_tab():
+    return next((t for t in list_tabs() if t["name"] == "poller"), None)
+
+
+def cmd_start(a):
+    problem = mux_problem()
+    if problem:
+        die(problem)
+    ensure_session()
+    if poller_tab():
+        print(f"poller is already running in {MUX} session '{SESSION}'")
+    else:
+        poll_args = (["--dry-run"] if a.dry_run else []) + (["--since", a.since] if a.since else [])
+        r = zj("new-tab", "-n", "poller", "-c", HERE, "--", sys.executable, os.path.join(HERE, "prbot.py"), "poll",
+               *poll_args)
+        if r.returncode != 0:
+            die(f"{MUX} new-tab failed: {r.stderr.strip()}")
+        print(f"poller started in {MUX} session '{SESSION}'")
+    print(f"attach:  {MUX} attach {SESSION}      (detach: Ctrl-o d)")
+
+
+def cmd_stop(a):
+    tab = poller_tab()
+    if tab is None:
+        print("poller not running")
+        return
+    zj("close-tab-by-id", str(tab["tab_id"]))
+    print(f"poller stopped. Open Claude tabs keep running; to end everything: {MUX} kill-session {SESSION}")
+
+
+def cmd_check(a):
+    """What prbot needs, one line each, then a test notification. Exits 1 if something is missing."""
+    bad = []
+
+    def line(ok, what, detail):
+        print(f"{'ok ' if ok else 'NO '} {what}: {detail}")
+        if not ok:
+            bad.append(what)
+
+    v = sys.version_info
+    line(v >= (3, 9), "python", f"{v.major}.{v.minor}.{v.micro} (3.9 or later)")
+    problem = mux_problem()
+    detail = f"{MUX}, session '{SESSION}'" + (f" ({tos_api()[1]})" if MUX == "tos" and not problem else "")
+    line(problem is None, "multiplexer", problem or detail)
+    r = subprocess.run(["gh", "auth", "token"], capture_output=True, text=True) if shutil.which("gh") else None
+    if r is None or r.returncode != 0 or not r.stdout.strip():
+        line(False, "gh", "not installed" if r is None else "not logged in: run gh auth login")
+    else:
+        try:
+            line(True, "gh", f"logged in; watching for @{me()}")
+        except Exception as e:  # GitHub unreachable, or a bad token
+            line(False, "gh", f"can't ask GitHub who you are: {e}")
+    line(bool(shutil.which("claude")), "claude", shutil.which("claude") or "not installed")
+    dirs = repo_dirs()
+    if not dirs:
+        line(False, "REPO_DIRS", "empty: set OWNER/REPO=PATH in config.env")
+    for repo, path in dirs.items():
+        line(bool(repo_dir(repo)), f"REPO_DIRS {repo}", path if repo_dir(repo) else f"{path} isn't a git clone")
+    method = process_check_method()
+    line(method is not None, "process check (before cleaning up a worktree)",
+         {"proc": "/proc", "lsof": "lsof"}.get(method, "no /proc and no lsof: worktrees are never cleaned up"))
+    cmd = desktop_notification("prbot: test notification", "If you can see this, notifications work.")
+    if shutil.which(cmd[0]):
+        notify("prbot: test notification", "If you can see this, notifications work.")
+        line(True, "notifications", f"sent one with {cmd[0]}" + (f", and to ntfy.sh/{CFG['NTFY_TOPIC']}" if CFG["NTFY_TOPIC"] else ""))
+    else:
+        line(bool(CFG["NTFY_TOPIC"]), "notifications", f"{cmd[0]} isn't installed"
+             + (f"; sent one to ntfy.sh/{CFG['NTFY_TOPIC']} only" if CFG["NTFY_TOPIC"] else ", and NTFY_TOPIC is empty"))
+        if CFG["NTFY_TOPIC"]:
+            notify("prbot: test notification", "If you can see this, notifications work.")
+    if bad:
+        sys.exit(1)
+
+
 COMMENT_URL_RE = re.compile(r"github\.com/([^/]+/[^/]+)/pull/(\d+)")
 
 
@@ -844,7 +1017,7 @@ def cmd_new_job(a):
     if find_tab(tab_name(t)):
         die(f"tab {tab_name(t)} is already open")
     spawn(t)
-    print(f"opened tab {tab_name(t)} in zellij session '{SESSION}'. Attach with: zellij attach {SESSION}")
+    print(f"opened tab {tab_name(t)} in {MUX} session '{SESSION}'. Attach with: {MUX} attach {SESSION}")
 
 
 def cmd_ls(a):
@@ -909,8 +1082,29 @@ def rereview_intro(n, extra):
     return f"Re-check my review on PR #{n}."
 
 
+def message_template(kind):
+    """The message for a kind of tab: from config.env (MESSAGE_REVIEW, ...) if it's set there, else prbot's own."""
+    return CFG.get(f"MESSAGE_{kind.upper()}") or MESSAGES[kind]
+
+
+def first_message(kind, fields):
+    """The first message for a tab: its template filled in, then the close-the-tab sentence."""
+    template = message_template(kind)
+    try:
+        names = {f for _, f, _, _ in string.Formatter().parse(template) if f is not None}
+        unknown = sorted(names - set(PLACEHOLDERS))
+        if unknown:
+            raise KeyError(unknown[0])
+        text = template.format(**fields)
+    except (KeyError, IndexError, ValueError) as e:
+        where = f"MESSAGE_{kind.upper()} in config.env" if CFG.get(f"MESSAGE_{kind.upper()}") else "its message"
+        known = ", ".join("{%s}" % k for k in PLACEHOLDERS)
+        raise PrbotError(f"{where} can't be filled in ({e!r}). Placeholders: {known}; write {{{{ and }}}} for braces")
+    return text + DONE_CLAUSE.format(prbot=HERE)
+
+
 def cmd_run(a):
-    """Inside a zellij tab: start Claude in your clone with a one-line instruction, then close the tab."""
+    """Inside a tab: start Claude in your clone with a one-line instruction, then close the tab."""
     def pause(msg):
         try:
             input(f"{msg} - press Enter to close this tab. ")
@@ -929,9 +1123,12 @@ def cmd_run(a):
             cwd, note = prepare_fix_worktree(a.repo, n)
         except (PrbotError, GHError) as e:
             return pause(f"prbot: {e}")
-    msg = (MESSAGES[a.kind] + DONE_CLAUSE).format(n=n, prbot=HERE, sha=(a.extra[0][:12] if a.extra else ""),
-                                                  url=(a.extra[0] if a.extra else ""), note=note,
-                                                  intro=rereview_intro(n, a.extra))
+    fields = dict(n=n, prbot=HERE, sha=(a.extra[0][:12] if a.extra else ""), url=(a.extra[0] if a.extra else ""),
+                  note=note, intro=rereview_intro(n, a.extra))
+    try:
+        msg = first_message(a.kind, fields)
+    except PrbotError as e:
+        return pause(f"prbot: {e}")
     try:
         if not os.get_terminal_size().columns:
             raise OSError
@@ -958,7 +1155,7 @@ CLOSING = os.path.join(CACHE, "closing")
 
 
 def closing_mark():
-    return os.path.join(CLOSING, re.sub(r"\D", "", os.environ.get("ZELLIJ_PANE_ID", "")) or "none")
+    return os.path.join(CLOSING, re.sub(r"\D", "", os.environ.get(PANE_VAR, "")) or "none")
 
 
 def cmd_done(a):
@@ -1052,6 +1249,10 @@ def cmd_hook(a):
 def main():
     p = argparse.ArgumentParser(prog="prbot", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("start"); s.set_defaults(fn=cmd_start)  # its options are passed on to poll
+    s.add_argument("--dry-run", action="store_true"); s.add_argument("--since")
+    s = sub.add_parser("stop"); s.set_defaults(fn=cmd_stop)
+    s = sub.add_parser("check"); s.set_defaults(fn=cmd_check)
     s = sub.add_parser("poll"); s.set_defaults(fn=cmd_poll)
     s.add_argument("--dry-run", action="store_true"); s.add_argument("--once", action="store_true"); s.add_argument("--since")
     s = sub.add_parser("new-job"); s.set_defaults(fn=cmd_new_job)
