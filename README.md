@@ -1,8 +1,10 @@
 # prbot
 
-Watches GitHub every minute. When a PR needs you, it opens a tab with Claude in your own clone of the repo and gives Claude a one-line instruction. Claude uses the repo's own `CLAUDE.md` and skills, such as `/review`. Each message tells Claude to wait for you before posting or pushing.
+Watches GitHub every minute. When a PR needs you, it uses the [tos](https://github.com/hugegene/termos) CLI to open a terminal tab with Claude in your own clone of the repo, and gives Claude a one-line instruction. Claude uses the repo's own `CLAUDE.md` and skills, such as `/review`. Each message tells Claude to wait for you before posting or pushing.
 
-The tabs live in a background session of [tos](https://github.com/hugegene/termos) or [zellij](https://zellij.dev), whichever you choose. prbot is an example of a tos extension: an ordinary program that drives tos through its command line. tos copied zellij's commands, so the same script drives both.
+![prbot picks up a review request, opens a rev-2 tab, and Claude reviews the PR, then waits before posting](docs/demo.gif)
+
+prbot is an example of a tos extension: an ordinary program that drives tos through the tos CLI, with commands such as `tos list-sessions`, `tos -s <session> action new-tab` and `tos -s <session> action rename-tab-by-id`. The tabs open in the tos session you start prbot in, or, if you start it outside any session, in prbot's own background session, `prbot`. tos copied [zellij](https://zellij.dev)'s commands, so the same script also drives zellij (`MUX=zellij`).
 
 ```
  ┌────────┐ 1. search, every 60 s  ┌──────────────────────┐ 2. tos -s prbot action new-tab -n rev-487 …  ┌──────────────────────┐
